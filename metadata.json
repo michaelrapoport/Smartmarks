@@ -1,0 +1,5 @@
+{
+  "name": "SmartMark AI",
+  "description": "Intelligent bookmark organizer powered by Gemini 2.5 Flash. Automatically cleans, categorizes, and structures messy bookmark files.",
+  "requestFramePermissions": []
+}

@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { AppState, BookmarkNode, BookmarkType, SortOption, QuizQuestion, QuizAnswer } from './types';
 import { parseBookmarks, serializeBookmarks, cleanUrl, deduplicateNodes, mergeSpecificFolders, flattenNodes } from './services/bookmarkParser';
-import { organizeBookmarksWithGemini, suggestFolderName, optimizeTitles, enrichBookmarks, generateUserPreferencesQuiz, generatePeriodicQuestion, parseAgentCommand } from './services/geminiService';
+import { organizeBookmarksWithGemini, suggestFolderName, optimizeTitles, enrichBookmarks, generateUserPreferencesQuiz, generatePeriodicQuestion, parseAgentCommand, autoFileBookmarks } from './services/geminiService';
 import { Button } from './components/Button';
 import { Radar } from './components/Radar';
 import { Toolbar } from './components/Toolbar';
@@ -16,7 +16,7 @@ import { QuizModal } from './components/QuizModal';
 import { LogWindow } from './components/LogWindow';
 import { ContextMenu } from './components/ContextMenu';
 import { AgentBar } from './components/AgentBar';
-import { UploadCloud, CheckCircle, Activity, LayoutGrid, AlertCircle, Settings } from 'lucide-react';
+import { UploadCloud, CheckCircle, Activity, LayoutGrid, AlertCircle, Settings, RefreshCcw } from 'lucide-react';
 
 const COOKIE_NAME = 'smartmark_quiz_answers';
 
@@ -31,6 +31,7 @@ const App: React.FC = () => {
   
   const [activeFolderId, setActiveFolderId] = useState<string>('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [lastSelectedId, setLastSelectedId] = useState<string | null>(null);
   
   // Quiz State
   const [quizQuestions, setQuizQuestions] = useState<QuizQuestion[]>([]);
@@ -64,6 +65,9 @@ const App: React.FC = () => {
   // New: Agent & Context Menu
   const [isAgentProcessing, setIsAgentProcessing] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, node: BookmarkNode } | null>(null);
+
+  // New: Auto Filer State
+  const [isAutoFiling, setIsAutoFiling] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -104,13 +108,145 @@ const App: React.FC = () => {
   };
 
   // --------------------------------------------------------------------------
+  // Background Process: Auto-Filer
+  // --------------------------------------------------------------------------
+  
+  useEffect(() => {
+    // Only run in Manager Mode
+    if (state !== AppState.MANAGER) return;
+    
+    const interval = setInterval(async () => {
+      // Prevent overlapping runs
+      if (isAutoFiling) return;
+      
+      // Find "Unsorted & Recovered"
+      const findUnsorted = (nodes: BookmarkNode[]): BookmarkNode | null => {
+        for (const n of nodes) {
+           if (n.type === BookmarkType.FOLDER && n.title === "Unsorted & Recovered") return n;
+           if (n.children) {
+             const found = findUnsorted(n.children);
+             if (found) return found;
+           }
+        }
+        return null;
+      };
+
+      const unsortedFolder = findUnsorted(rootNodes);
+      
+      // Check if it has candidate links
+      const candidates = unsortedFolder?.children?.filter(
+        c => c.type === BookmarkType.LINK && !(c.tags || []).includes('review-required')
+      ).slice(0, 5) || [];
+
+      if (candidates.length === 0) return;
+
+      setIsAutoFiling(true);
+      
+      try {
+        // Collect available paths (Flat list of folder names/paths)
+        const paths: string[] = [];
+        const collectPaths = (nodes: BookmarkNode[], currentPath: string) => {
+          nodes.forEach(n => {
+            if (n.type === BookmarkType.FOLDER && n.id !== unsortedFolder!.id) {
+               const p = currentPath ? `${currentPath}/${n.title}` : n.title;
+               paths.push(p);
+               if (n.children) collectPaths(n.children, p);
+            }
+          });
+        };
+        collectPaths(rootNodes, "");
+
+        // Call Gemini
+        const results = await autoFileBookmarks(candidates, paths);
+
+        if (results.length > 0) {
+           let updatedNodes = [...rootNodes];
+           let moveCount = 0;
+
+           // Apply changes
+           results.forEach(res => {
+              if (!res.targetPath || res.targetPath === 'Unsorted' || res.targetPath === 'null') {
+                 // Tag as review required
+                 updatedNodes = updateNodeRecursive(updatedNodes, (n) => {
+                   if (n.id === res.id) {
+                     return { ...n, tags: [...(n.tags || []), 'review-required'] };
+                   }
+                   return n;
+                 });
+                 return;
+              }
+
+              const targetName = res.targetPath.split('/').pop();
+              let targetId = '';
+              const findTargetId = (nodes: BookmarkNode[]) => {
+                 for (const n of nodes) {
+                   if (n.type === BookmarkType.FOLDER && n.title === targetName) {
+                      targetId = n.id;
+                      return;
+                   }
+                   if (n.children) findTargetId(n.children);
+                 }
+              };
+              findTargetId(updatedNodes);
+
+              if (targetId) {
+                // Move logic
+                let itemToMove: BookmarkNode | null = null;
+                updatedNodes = removeNodeRecursive(res.id, updatedNodes);
+                itemToMove = candidates.find(c => c.id === res.id) || null;
+
+                if (itemToMove) {
+                   if (res.newTitle) itemToMove.title = res.newTitle;
+                   const targetNode = findNode(targetId, updatedNodes);
+                   if (targetNode && targetNode.children) {
+                      targetNode.children.push(itemToMove);
+                      moveCount++;
+                   }
+                }
+              } else {
+                 updatedNodes = updateNodeRecursive(updatedNodes, (n) => {
+                   if (n.id === res.id) {
+                     return { ...n, tags: [...(n.tags || []), 'review-required'] };
+                   }
+                   return n;
+                 });
+              }
+           });
+
+           if (moveCount > 0) {
+             addLog(`AutoFiler: Successfully filed ${moveCount} items.`);
+             setRootNodes(updatedNodes);
+           }
+        } else {
+           let updatedNodes = [...rootNodes];
+           candidates.forEach(c => {
+             updatedNodes = updateNodeRecursive(updatedNodes, (n) => {
+                if (n.id === c.id) return { ...n, tags: [...(n.tags || []), 'review-required'] };
+                return n;
+             });
+           });
+           setRootNodes(updatedNodes);
+        }
+
+      } catch (e) {
+        console.error("AutoFile Loop Error", e);
+      } finally {
+        setIsAutoFiling(false);
+      }
+
+    }, 5000); 
+
+    return () => clearInterval(interval);
+  }, [state, rootNodes, isAutoFiling]); 
+
+  // --------------------------------------------------------------------------
   // Helpers
   // --------------------------------------------------------------------------
 
   const addLog = (msg: string) => {
     setLogs(prev => {
       const newLogs = [...prev, msg];
-      if (newLogs.length > 50) return newLogs.slice(newLogs.length - 50); // Keep last 50
+      if (newLogs.length > 50) return newLogs.slice(newLogs.length - 50); 
       return newLogs;
     });
   };
@@ -180,6 +316,61 @@ const App: React.FC = () => {
     const children = getActiveFolderChildren();
     return children.some(c => c.type === BookmarkType.FOLDER && selectedIds.has(c.id));
   }, [selectedIds, activeFolderId, rootNodes]);
+
+  // --------------------------------------------------------------------------
+  // Selection Logic (Range support)
+  // --------------------------------------------------------------------------
+
+  const handleToggleSelect = (id: string, multi: boolean, range: boolean) => {
+    let newSet = new Set(multi ? selectedIds : []);
+    
+    // Check for Range Selection (Shift Click)
+    if (range && lastSelectedId) {
+        const idx1 = sortedItems.findIndex(i => i.id === lastSelectedId);
+        const idx2 = sortedItems.findIndex(i => i.id === id);
+        
+        if (idx1 !== -1 && idx2 !== -1) {
+            const start = Math.min(idx1, idx2);
+            const end = Math.max(idx1, idx2);
+            const rangeItems = sortedItems.slice(start, end + 1);
+            
+            if (multi) {
+                // Union
+                rangeItems.forEach(item => newSet.add(item.id));
+            } else {
+                // Replace
+                newSet = new Set(rangeItems.map(item => item.id));
+            }
+        } else {
+             // Fallback if anchor is missing in current view
+             newSet = new Set([id]);
+             setLastSelectedId(id);
+        }
+    } else {
+        // Standard Click or Ctrl+Click
+        if (multi) {
+            if (newSet.has(id)) newSet.delete(id);
+            else newSet.add(id);
+        } else {
+            // Single click replaces selection
+            newSet = new Set([id]);
+        }
+        // Update anchor on explicit click
+        setLastSelectedId(id);
+    }
+
+    setSelectedIds(newSet);
+  };
+
+  const handleOpenNode = (node: BookmarkNode) => {
+    if (node.type === BookmarkType.FOLDER) {
+      setActiveFolderId(node.id);
+      setSelectedIds(new Set()); // Clear selection on navigate
+      setLastSelectedId(null); // Clear anchor
+    } else {
+      setModalNode(node);
+    }
+  };
 
   // --------------------------------------------------------------------------
   // New Logic: Drag and Drop
@@ -255,8 +446,7 @@ const App: React.FC = () => {
       };
 
       if (plan.action === 'CREATE_FOLDER') {
-        // Create in root or active folder
-        const parentId = activeFolderId || rootNodes[0]?.id; // Default to first root if no active
+        const parentId = activeFolderId || rootNodes[0]?.id; 
         const parent = findNode(parentId, modifiedNodes);
         if (parent && parent.children) {
            parent.children.unshift({
@@ -270,7 +460,6 @@ const App: React.FC = () => {
         }
       } 
       else if (plan.action === 'DELETE') {
-         // Gather IDs to delete
          const idsToDelete: string[] = [];
          const traverse = (list: BookmarkNode[]) => {
            list.forEach(n => {
@@ -288,11 +477,7 @@ const App: React.FC = () => {
       }
       else if (plan.action === 'MOVE') {
          if (!plan.targetName) return;
-         
-         // 1. Find or Create Target Folder
          let targetId = '';
-         
-         // Search existing
          const findTarget = (list: BookmarkNode[]) => {
             for(const n of list) {
               if (n.type === BookmarkType.FOLDER && n.title.toLowerCase() === plan.targetName?.toLowerCase()) {
@@ -305,7 +490,6 @@ const App: React.FC = () => {
          findTarget(modifiedNodes);
 
          if (!targetId) {
-            // Create it at root level for simplicity if not found
             const newFolder = {
                id: crypto.randomUUID(),
                type: BookmarkType.FOLDER,
@@ -318,7 +502,6 @@ const App: React.FC = () => {
             addLog(`Agent: Created target folder "${plan.targetName}"`);
          }
 
-         // 2. Find Items to Move
          const nodesToMove: BookmarkNode[] = [];
          const collectMoves = (list: BookmarkNode[]) => {
             list.forEach(n => {
@@ -331,12 +514,9 @@ const App: React.FC = () => {
          collectMoves(modifiedNodes);
          
          if (nodesToMove.length > 0) {
-           // 3. Remove old
            nodesToMove.forEach(n => {
              modifiedNodes = removeNodeRecursive(n.id, modifiedNodes);
            });
-           
-           // 4. Add to target
            const targetNode = findNode(targetId, modifiedNodes);
            if (targetNode && targetNode.children) {
              targetNode.children.push(...nodesToMove);
@@ -381,15 +561,25 @@ const App: React.FC = () => {
         setLogs([]);
         addLog("Initiating file parser sequence...");
         // 1. Parse
-        const rawNodes = parseBookmarks(content);
+        const { nodes: rawNodes, isSmartMarkFile } = parseBookmarks(content);
         addLog(`Parsed ${rawNodes.length} root elements.`);
         
         // 2. Initial Deduplicate (Fast)
         const { uniqueNodes, duplicatesRemoved } = deduplicateNodes(rawNodes);
-        console.log(`Deep cleaning: Removed ${duplicatesRemoved} duplicates recursively.`);
         addLog(`Initial clean: Pruned ${duplicatesRemoved} obvious duplicates.`);
 
-        // 3. Move to Liveness Check
+        // 3. Import Bypass Check
+        if (isSmartMarkFile) {
+          if (window.confirm("SmartMark backup detected. Skip AI analysis and open directly?")) {
+            setRootNodes(uniqueNodes);
+            if (uniqueNodes.length > 0) setActiveFolderId(uniqueNodes[0].id);
+            setState(AppState.MANAGER);
+            addLog("Import: AI Analysis skipped. Manager Active.");
+            return;
+          }
+        }
+
+        // 4. Move to Liveness Check
         setRootNodes(uniqueNodes);
         setState(AppState.LIVENESS_CHECK);
         performLivenessCheck(uniqueNodes);
@@ -399,7 +589,6 @@ const App: React.FC = () => {
       }
     };
     reader.readAsText(file);
-    // Reset input
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -407,7 +596,6 @@ const App: React.FC = () => {
     setLoadingMsg(`Deep scanning for dead links (Concurrency: ${concurrency})...`);
     addLog(`Starting Liveness Protocol. Concurrency Level: ${concurrency}`);
     
-    // Flatten to find all links recursively
     const flat: BookmarkNode[] = [];
     const collect = (list: BookmarkNode[]) => {
       list.forEach(n => {
@@ -425,7 +613,6 @@ const App: React.FC = () => {
          if (!node.url) return;
          node.status = 'checking';
          try {
-           // We can't easily get status codes with no-cors, but failure usually means network error or blocked
            await fetch(node.url, { mode: 'no-cors', signal: AbortSignal.timeout(2000) });
            node.status = 'active'; 
          } catch (e) {
@@ -435,26 +622,18 @@ const App: React.FC = () => {
        }));
     };
 
-    // Process in chunks determined by concurrency setting
     const chunkSize = Math.max(1, concurrency);
     for (let i = 0; i < flat.length; i += chunkSize) {
       await checkBatch(flat.slice(i, i + chunkSize));
       completed += Math.min(chunkSize, flat.length - i);
       setProgress(Math.min((completed / total) * 100, 100));
-      // Force re-render 
       await new Promise(r => setTimeout(r, 20)); 
     }
     
     addLog("Liveness Protocol concluded.");
-    
-    // --- POST LIVENESS CLEANUP ---
-    
-    // 1. Merge "Imported" Folders
     addLog("Topology: Scanning for 'Imported/Other' bookmark containers to dissolve...");
     const mergedNodes = mergeSpecificFolders(nodes);
     addLog("Topology: 'Imported' containers merged into main structure.");
-    
-    // 2. Second Pass Deduplication (Catch duplicates revealed by merge)
     addLog("Sanitization: Re-scanning for duplicate links post-merge...");
     const { uniqueNodes: finalNodes, duplicatesRemoved } = deduplicateNodes(mergedNodes);
     if (duplicatesRemoved > 0) {
@@ -462,30 +641,21 @@ const App: React.FC = () => {
     } else {
       addLog("Sanitization: No additional duplicates found.");
     }
-    
-    setRootNodes(finalNodes); // Update state with clean nodes
-    
-    // Proceed to AI
+    setRootNodes(finalNodes); 
     startAiOrganization(finalNodes);
   };
 
   const startAiOrganization = async (nodes: BookmarkNode[]) => {
-    setBackupNodes(JSON.parse(JSON.stringify(nodes))); // Deep copy for backup
-    
-    // Phase 1: Enrichment (Normalization)
+    setBackupNodes(JSON.parse(JSON.stringify(nodes)));
     setState(AppState.AI_ENRICHMENT);
     setLoadingMsg("Initializing Swarm Agents...");
     addLog("Initializing Swarm Intelligence for content enrichment...");
     setProgress(0);
     setQuizCompleted(false);
-    // Don't reset quiz answers if we have them from cookie, only questions
     setQuizQuestions([]);
     quizQuestionsRef.current = [];
     enrichmentCompleteRef.current = false;
 
-    // ----------------------------------------------------
-    // ASYNC TASK 1: Initial Quiz Agent (Non-Blocking)
-    // ----------------------------------------------------
     (async () => {
       try {
         addLog("Preference Agent: Analyzing current topology for profiling...");
@@ -501,11 +671,6 @@ const App: React.FC = () => {
       }
     })();
 
-    // ----------------------------------------------------
-    // ASYNC TASK 2: Swarm Enrichment Loop (Main Thread)
-    // ----------------------------------------------------
-    
-    // Recursively collect all links
     const allLinks: BookmarkNode[] = [];
     const collectLinks = (list: BookmarkNode[]) => {
       list.forEach(n => {
@@ -515,22 +680,15 @@ const App: React.FC = () => {
     };
     collectLinks(nodes);
 
-    // Swarm Configuration
-    const swarmSize = 4; // 4 Concurrent agents
-    const batchSize = 25; // Smaller batch size per agent for responsiveness
+    const swarmSize = 4;
+    const batchSize = 25;
     let processedCount = 0;
     
-    // Insight tracking
     let itemsSinceLastInsight = 0;
-    const INSIGHT_THRESHOLD = 60; // Check for insight every ~60 items
+    const INSIGHT_THRESHOLD = 60;
 
-    // Worker Function
     const processBatch = async (batch: BookmarkNode[], workerId: number) => {
-      // Call Gemini Flash
-      // addLog(`Swarm Agent ${workerId}: Fetching metadata for ${batch.length} nodes...`);
       const enrichedMap = await enrichBookmarks(batch);
-      
-      // Update nodes in-place
       let enrichedCount = 0;
       batch.forEach(node => {
         const info = enrichedMap.get(node.id);
@@ -546,11 +704,9 @@ const App: React.FC = () => {
       processedCount += batch.length;
       itemsSinceLastInsight += batch.length;
 
-      // Check if we should generate a periodic question
       if (itemsSinceLastInsight >= INSIGHT_THRESHOLD) {
         itemsSinceLastInsight = 0;
         addLog("Insight Agent: Detecting organizational ambiguity in recent batch...");
-        // Fire and forget insight generation - non blocking for the worker
         generatePeriodicQuestion(batch, quizQuestionsRef.current.map(q => q.question))
           .then(newQuestion => {
             if (newQuestion && !enrichmentCompleteRef.current) {
@@ -561,31 +717,23 @@ const App: React.FC = () => {
                 return next;
               });
               setIsQuizOpen(true);
-            } else {
-               // addLog("Insight Agent: No new ambiguities found.");
             }
           });
       }
-
-      // Update UI Progress
       const p = Math.min((processedCount / allLinks.length) * 100, 100);
       setProgress(p);
       setLoadingMsg(`Swarm Active: ${Math.min(processedCount, allLinks.length)} / ${allLinks.length} links enriched...`);
     };
 
-    // Queue Management
     const batches = [];
     for (let i = 0; i < allLinks.length; i += batchSize) {
       batches.push(allLinks.slice(i, i + batchSize));
     }
-
     addLog(`Swarm Controller: Dispatching ${batches.length} batches to ${swarmSize} concurrent agents.`);
 
-    // Process batches with limited concurrency
     const runSwarm = async () => {
        const executing: Promise<void>[] = [];
        for (const batch of batches) {
-          // Assign a faux worker ID based on current slot
           const workerId = executing.length + 1;
           const p = processBatch(batch, workerId);
           executing.push(p);
@@ -603,26 +751,16 @@ const App: React.FC = () => {
     await runSwarm();
     addLog("Enrichment Phase Complete. All nodes contain metadata.");
 
-    // ----------------------------------------------------
-    // SYNCHRONIZATION: Force close Quiz if it's still open
-    // ----------------------------------------------------
     enrichmentCompleteRef.current = true;
-    if (isQuizOpen) {
-      // Quiz was still open, close it and proceed with whatever partial answers we have
-      setIsQuizOpen(false);
-    }
+    if (isQuizOpen) setIsQuizOpen(false);
 
-    // Phase 2: Organization (Structure)
     setState(AppState.AI_ANALYSIS);
     setLoadingMsg(`Gemini 3 Flash is analyzing metadata to architect tree...`);
     addLog("Handing off context to Gemini 3 Flash Architect...");
     setProgress(0);
-
-    // Use current quizAnswers state (which is updated incrementally)
     addLog(`Architect: Compiling user preferences and topological constraints. Depth Mode: ${treeDepth}`);
     
     try {
-      // NOTE: Using aiBatchSize to potentially limit items sent, but usually we try to send as many as possible
       const structure = await organizeBookmarksWithGemini(nodes, aiBatchSize, quizAnswers, treeDepth);
       addLog("Architect: Structural blueprint generated.");
       
@@ -640,10 +778,8 @@ const App: React.FC = () => {
       
       const nodeMap = flatten(nodes);
       const usedIds = new Set<string>();
-
       addLog("System: Materializing new folder hierarchy...");
       
-      // Recursive builder that also tracks which IDs were used
       const processLevel = (obj: any): BookmarkNode[] => {
         const levelNodes: BookmarkNode[] = [];
         Object.entries(obj).forEach(([key, val]) => {
@@ -679,7 +815,6 @@ const App: React.FC = () => {
 
       const structuredNodes = processLevel(structure);
       
-      // --- SAFEGUARD: RECONCILE MISSING LINKS ---
       addLog("System: Verifying data integrity...");
       const missingNodes: BookmarkNode[] = [];
       allLinks.forEach(link => {
@@ -713,146 +848,43 @@ const App: React.FC = () => {
     }
   };
 
-  const handleQuizUpdate = (answers: QuizAnswer[]) => {
-    saveQuizAnswers(answers);
-  };
-
-  const handleQuizComplete = (answers: QuizAnswer[]) => {
-    saveQuizAnswers(answers);
-    setIsQuizOpen(false);
-    setQuizCompleted(true);
-  };
-
-  const handleQuizSkip = () => {
-    setIsQuizOpen(false);
-    setQuizCompleted(true);
-  };
-
   const handleWizardConfirm = (selectedFolderIds: Set<string>) => {
-    // Flatten logic: If a folder is NOT in selectedFolderIds, we lift its children up
     const processNodes = (nodes: BookmarkNode[]): BookmarkNode[] => {
       let result: BookmarkNode[] = [];
-      
       nodes.forEach(node => {
         if (node.type === BookmarkType.FOLDER) {
           if (selectedFolderIds.has(node.id)) {
-            // Keep this folder, process its children
             const newChildren = processNodes(node.children || []);
-            // Only keep folder if it has children after processing? Or keep empty? Let's keep empty if user selected it.
             result.push({ ...node, children: newChildren });
           } else {
-            // Dissolve this folder, lift children
             if (node.children) {
               const lifted = processNodes(node.children);
               result = result.concat(lifted);
             }
           }
         } else {
-          // Links are always kept
           result.push(node);
         }
       });
-      
       return result;
     };
-
     const finalNodes = processNodes(proposedNodes);
     setRootNodes(finalNodes);
     if(finalNodes.length > 0) setActiveFolderId(finalNodes[0].id);
     setState(AppState.MANAGER);
-    // Log window stays open as requested
     addLog("Structure finalized. Manager Active.");
   };
 
   const handleWizardCancel = () => {
-    // Restore backup
     setRootNodes(backupNodes);
     if(backupNodes.length > 0) setActiveFolderId(backupNodes[0].id);
     setState(AppState.MANAGER);
     addLog("Changes discarded. Restored original topology.");
   };
 
-
-  // --------------------------------------------------------------------------
-  // Dashboard Handlers
-  // --------------------------------------------------------------------------
-
-  const handleToggleSelect = (id: string, multi: boolean) => {
-    const newSet = new Set(multi ? selectedIds : []);
-    if (newSet.has(id)) newSet.delete(id);
-    else newSet.add(id);
-    setSelectedIds(newSet);
-  };
-
-  const handleOpenNode = (node: BookmarkNode) => {
-    if (node.type === BookmarkType.FOLDER) {
-      setActiveFolderId(node.id);
-      setSelectedIds(new Set()); // Clear selection on navigate
-    } else {
-      setModalNode(node);
-    }
-  };
-
-  const handleAutoGroup = async () => {
-    if (selectedIds.size < 2) return;
-    
-    // Find actual nodes
-    const children = getActiveFolderChildren();
-    const selectedNodes = children.filter(c => selectedIds.has(c.id));
-    
-    setLoadingMsg("Gemini 3 Pro is brainstorming a group name...");
-    const name = await suggestFolderName(selectedNodes);
-    
-    const parent = findNode(activeFolderId, rootNodes);
-    if (parent && parent.children) {
-      const newFolder: BookmarkNode = {
-        id: crypto.randomUUID(),
-        type: BookmarkType.FOLDER,
-        title: name,
-        children: selectedNodes,
-        status: 'active'
-      };
-      
-      parent.children = parent.children.filter(c => !selectedIds.has(c.id));
-      parent.children.unshift(newFolder);
-      
-      setRootNodes([...rootNodes]); 
-      setSelectedIds(new Set());
-    }
-    setLoadingMsg("");
-  };
-
-  const handleSmartRename = async () => {
-    const children = getActiveFolderChildren();
-    const selectedNodes = children.filter(c => selectedIds.has(c.id) && c.type === BookmarkType.LINK);
-    if (selectedNodes.length === 0) return;
-
-    addLog(`Optimization: Sending ${selectedNodes.length} titles to Gemini 2.5 Flash...`);
-    setLoadingMsg(`Optimizing ${selectedNodes.length} titles...`);
-    const newTitlesMap = await optimizeTitles(selectedNodes);
-    
-    let changedCount = 0;
-    selectedNodes.forEach(node => {
-      if (newTitlesMap.has(node.id)) {
-        const newTitle = newTitlesMap.get(node.id)!;
-        if (newTitle !== node.title) {
-          node.title = newTitle;
-          node.metaDescription = "Title optimized by Gemini 2.5 Flash";
-          changedCount++;
-        }
-      }
-    });
-    
-    setRootNodes([...rootNodes]);
-    setLoadingMsg("");
-    addLog(`Optimization: Updated ${changedCount} titles.`);
-  };
-
-  // Bulk Actions
   const handleBulkTag = () => {
     const tag = window.prompt("Enter tag name:");
     if (!tag) return;
-
     const newNodes = updateNodeRecursive(rootNodes, (node) => {
       if (selectedIds.has(node.id)) {
         const tags = node.tags || [];
@@ -862,51 +894,44 @@ const App: React.FC = () => {
       }
       return node;
     });
-
     setRootNodes(newNodes);
     setSelectedIds(new Set());
   };
 
   const handleBulkMarkDead = () => {
     if (!window.confirm(`Mark ${selectedIds.size} items as Dead?`)) return;
-
     const newNodes = updateNodeRecursive(rootNodes, (node) => {
       if (selectedIds.has(node.id) && node.type === BookmarkType.LINK) {
         return { ...node, status: 'dead' };
       }
       return node;
     });
-
     setRootNodes(newNodes);
     setSelectedIds(new Set());
   };
 
   const handleBulkMoveConfirm = (targetFolderId: string) => {
     if (!targetFolderId) return;
-
-    // 1. Collect nodes to move (make deep copies)
     const nodesToMove: BookmarkNode[] = [];
     const collectNodes = (list: BookmarkNode[]) => {
       list.forEach(node => {
         if (selectedIds.has(node.id)) {
-           nodesToMove.push({ ...node }); // Shallow copy sufficient for logic, children handled if folder
+           nodesToMove.push({ ...node }); 
         }
         if (node.children) collectNodes(node.children);
       });
     };
     collectNodes(rootNodes);
 
-    // 2. Remove from old locations
     let newRoot = rootNodes;
     selectedIds.forEach(id => {
       newRoot = removeNodeRecursive(id, newRoot);
     });
 
-    // 3. Add to new target
     const targetFolder = findNode(targetFolderId, newRoot);
     if (targetFolder && targetFolder.children) {
       targetFolder.children.push(...nodesToMove);
-      setRootNodes([...newRoot]); // Force update
+      setRootNodes([...newRoot]); 
       setSelectedIds(new Set());
       setIsMoveModalOpen(false);
     } else {
@@ -923,9 +948,7 @@ const App: React.FC = () => {
     }
   };
 
-  // New: Folder Deletion with Confirmation Logic
   const handleDeleteFolderButton = () => {
-    // Check if any selected items are non-empty folders
     const children = getActiveFolderChildren();
     const nonEmptyFolders = children.filter(c => 
       selectedIds.has(c.id) && 
@@ -937,7 +960,6 @@ const App: React.FC = () => {
     if (nonEmptyFolders.length > 0 && !suppressDeleteWarning) {
       setIsDeleteModalOpen(true);
     } else {
-      // Safe to delete immediately
       performDelete();
     }
   };
@@ -958,7 +980,6 @@ const App: React.FC = () => {
   };
 
   const handleDeleteItem = (id: string) => {
-     // Recursive delete from root (safest)
      const newRoot = removeNodeRecursive(id, rootNodes);
      setRootNodes([...newRoot]);
      if (selectedIds.has(id)) {
@@ -1019,11 +1040,120 @@ const App: React.FC = () => {
     document.body.removeChild(a);
   };
 
-  // --------------------------------------------------------------------------
-  // Render
-  // --------------------------------------------------------------------------
+  // Missing Quiz Handlers
+  const handleQuizUpdate = (answers: QuizAnswer[]) => {
+    setQuizAnswers(answers);
+  };
 
-  // Shared hidden input
+  const handleQuizComplete = (answers: QuizAnswer[]) => {
+    saveQuizAnswers(answers);
+    setQuizCompleted(true);
+    setIsQuizOpen(false);
+  };
+
+  const handleQuizSkip = () => {
+    setIsQuizOpen(false);
+  };
+
+  // Missing Toolbar Handlers
+  const handleAutoGroup = async () => {
+    if (selectedIds.size < 2) return;
+    setLoadingMsg("Analyzing selected items for grouping...");
+    
+    // 1. Snapshot selected nodes (shallow copy properties to be safe)
+    const selectedNodes: BookmarkNode[] = [];
+    const collect = (list: BookmarkNode[]) => {
+        list.forEach(n => {
+            if (selectedIds.has(n.id)) selectedNodes.push({...n});
+            if (n.children) collect(n.children);
+        });
+    };
+    collect(rootNodes);
+    
+    if (selectedNodes.length === 0) {
+        setLoadingMsg("");
+        return;
+    }
+
+    try {
+        const suggestedName = await suggestFolderName(selectedNodes);
+        
+        // 2. Remove selected nodes from the *current* rootNodes
+        let newRoot = rootNodes;
+        selectedIds.forEach(id => {
+            newRoot = removeNodeRecursive(id, newRoot);
+        });
+        
+        // 3. Create new folder
+        const newFolder: BookmarkNode = {
+            id: crypto.randomUUID(),
+            type: BookmarkType.FOLDER,
+            title: suggestedName,
+            children: selectedNodes,
+            status: 'active'
+        };
+
+        // 4. Find parent to insert new folder into
+        // We find the node corresponding to activeFolderId in the new tree
+        const targetParent = findNode(activeFolderId, newRoot);
+        if (targetParent && targetParent.children) {
+            targetParent.children.unshift(newFolder);
+        } else if (newRoot.length > 0 && !targetParent) {
+             // If parent not found (e.g. root or deleted), push to root list
+             newRoot.unshift(newFolder);
+        }
+
+        setRootNodes([...newRoot]);
+        setSelectedIds(new Set());
+        addLog(`AutoGroup: Created "${suggestedName}" with ${selectedNodes.length} items.`);
+
+    } catch (e) {
+        console.error(e);
+        addLog("AutoGroup failed.");
+    } finally {
+        setLoadingMsg("");
+    }
+  };
+
+  const handleSmartRename = async () => {
+    if (selectedIds.size === 0) return;
+    setLoadingMsg("Optimizing titles...");
+
+    const selectedNodes: BookmarkNode[] = [];
+    const collect = (list: BookmarkNode[]) => {
+        list.forEach(n => {
+            if (selectedIds.has(n.id) && n.type === BookmarkType.LINK) selectedNodes.push(n);
+            if (n.children) collect(n.children);
+        });
+    };
+    collect(rootNodes);
+
+    if (selectedNodes.length === 0) {
+        setLoadingMsg("");
+        return;
+    }
+
+    try {
+        const nameMap = await optimizeTitles(selectedNodes);
+        let updatedCount = 0;
+        
+        const newRoot = updateNodeRecursive(rootNodes, (node) => {
+            if (nameMap.has(node.id)) {
+                updatedCount++;
+                return { ...node, title: nameMap.get(node.id)! };
+            }
+            return node;
+        });
+        
+        setRootNodes(newRoot);
+        addLog(`SmartRename: Updated ${updatedCount} titles.`);
+    } catch(e) {
+        addLog("SmartRename failed.");
+    } finally {
+        setLoadingMsg("");
+    }
+  };
+
   const FileInput = () => (
     <input type="file" ref={fileInputRef} className="hidden" accept=".html" onChange={handleFileUpload} />
   );
@@ -1032,7 +1162,6 @@ const App: React.FC = () => {
     <div className="h-screen bg-slate-900 flex flex-col text-slate-200 overflow-hidden relative">
       <FileInput />
       
-      {/* Context Menu */}
       {contextMenu && (
         <ContextMenu 
           position={contextMenu} 
@@ -1054,7 +1183,6 @@ const App: React.FC = () => {
         />
       )}
 
-      {/* Settings Modal */}
       {isSettingsOpen && (
         <SettingsModal 
           concurrency={concurrency}
@@ -1067,7 +1195,6 @@ const App: React.FC = () => {
         />
       )}
 
-      {/* Move Modal */}
       {isMoveModalOpen && (
         <MoveModal 
           rootNodes={rootNodes}
@@ -1077,7 +1204,6 @@ const App: React.FC = () => {
         />
       )}
 
-      {/* Delete Confirmation Modal */}
       {isDeleteModalOpen && (
          <DeleteConfirmModal 
            count={selectedIds.size}
@@ -1086,7 +1212,6 @@ const App: React.FC = () => {
          />
       )}
       
-      {/* Quiz Modal */}
       {isQuizOpen && (
         <QuizModal 
           questions={quizQuestions} 
@@ -1096,17 +1221,14 @@ const App: React.FC = () => {
         />
       )}
 
-      {/* Log Window - visible during all states except UPLOAD */}
       {state !== AppState.UPLOAD && (
         <LogWindow logs={logs} />
       )}
 
-      {/* Agent Bar - Visible in Manager */}
       {state === AppState.MANAGER && (
         <AgentBar onCommand={handleAgentCommand} isProcessing={isAgentProcessing} />
       )}
 
-      {/* Upload Screen */}
       {state === AppState.UPLOAD && (
         <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-6 w-full absolute inset-0 z-50">
            <div className="absolute top-4 right-4">
@@ -1145,7 +1267,6 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {/* Processing States */}
       {(state === AppState.LIVENESS_CHECK || state === AppState.AI_ANALYSIS || state === AppState.AI_ENRICHMENT) && (
         <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center absolute inset-0 z-50">
           <Radar />
@@ -1161,7 +1282,6 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {/* Wizard Overlay */}
       {state === AppState.WIZARD_REVIEW && (
         <StructureWizard 
           nodes={proposedNodes}
@@ -1171,7 +1291,6 @@ const App: React.FC = () => {
         />
       )}
 
-      {/* Top Bar */}
       <Toolbar 
         selectedCount={selectedIds.size}
         hasSelectedFolders={hasSelectedFolders}
@@ -1195,7 +1314,6 @@ const App: React.FC = () => {
         onSortChange={setSortOption}
       />
 
-      {/* Workspace */}
       <div className="flex-1 flex min-h-0">
         <Sidebar 
           nodes={rootNodes} 
@@ -1207,7 +1325,8 @@ const App: React.FC = () => {
         
         <main className="flex-1 bg-slate-900/50 flex flex-col relative">
            {loadingMsg && state === AppState.MANAGER && (
-             <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-blue-600 text-white px-4 py-2 rounded-full shadow-lg z-20 text-sm font-medium animate-in slide-in-from-top-4 fade-in">
+             <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-blue-600 text-white px-4 py-2 rounded-full shadow-lg z-20 text-sm font-medium animate-in slide-in-from-top-4 fade-in flex items-center gap-2">
+               {isAutoFiling && <RefreshCcw className="animate-spin" size={14} />}
                {loadingMsg}
              </div>
            )}

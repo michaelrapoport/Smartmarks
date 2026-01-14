@@ -1,10 +1,13 @@
 import { BookmarkNode, BookmarkType } from '../types';
 
-export const parseBookmarks = (htmlContent: string): BookmarkNode[] => {
+export const parseBookmarks = (htmlContent: string): { nodes: BookmarkNode[], isSmartMarkFile: boolean } => {
   const parser = new DOMParser();
   const doc = parser.parseFromString(htmlContent, 'text/html');
   const rootDl = doc.querySelector('dl');
   
+  // Check for SmartMark metadata
+  const isSmartMarkFile = !!doc.querySelector('meta[name="smartmark-analyzed"]');
+
   if (!rootDl) {
     throw new Error('Invalid Netscape Bookmark File: No root DL found.');
   }
@@ -57,7 +60,7 @@ export const parseBookmarks = (htmlContent: string): BookmarkNode[] => {
     return nodes;
   };
 
-  return traverse(rootDl);
+  return { nodes: traverse(rootDl), isSmartMarkFile };
 };
 
 export const mergeSpecificFolders = (nodes: BookmarkNode[]): BookmarkNode[] => {
@@ -103,8 +106,6 @@ export const deduplicateNodes = (nodes: BookmarkNode[]): { uniqueNodes: Bookmark
         result.push({ node, isToolbarDescendant: isToolbar });
       }
       if (node.children) {
-        result.concat(flattenAndMark(node.children, isToolbar)); // Bug fix: was result = result.concat... but recursion here needs care. 
-        // Actually, let's fix the recursion logic to be safer:
         result.push(...flattenAndMark(node.children, isToolbar));
       }
     });
@@ -176,7 +177,11 @@ export const serializeBookmarks = (nodes: BookmarkNode[]): string => {
   };
 
   return `<!DOCTYPE NETSCAPE-Bookmark-file-1>
+<!-- This is an automatically generated file.
+     It has been read and overwritten.
+     Do not edit. -->
 <META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">
+<META NAME="smartmark-analyzed" CONTENT="true">
 <TITLE>Bookmarks</TITLE>
 <H1>Bookmarks</H1>
 <DL><p>

@@ -5,7 +5,7 @@ import { ExternalLink, Globe, AlertCircle, CheckCircle, Clock, FolderOpen, Trash
 interface FileGridProps {
   items: BookmarkNode[];
   selectedIds: Set<string>;
-  onToggleSelect: (id: string, multi: boolean) => void;
+  onToggleSelect: (id: string, multi: boolean, range: boolean) => void;
   onOpen: (node: BookmarkNode) => void;
   onDeleteItem: (id: string) => void;
   viewMode: 'grid' | 'list';
@@ -33,6 +33,15 @@ export const FileGrid: React.FC<FileGridProps> = ({
   const handleDragEnd = (e: React.DragEvent) => {
     const el = e.target as HTMLElement;
     el.style.opacity = '1';
+  };
+
+  const handleClick = (e: React.MouseEvent, item: BookmarkNode) => {
+    // Prevent default to avoid unwanted text selection during shift-click
+    if (e.shiftKey) {
+       const selection = window.getSelection();
+       if (selection) selection.removeAllRanges();
+    }
+    onToggleSelect(item.id, e.metaKey || e.ctrlKey, e.shiftKey);
   };
 
   if (items.length === 0) {
@@ -64,13 +73,13 @@ export const FileGrid: React.FC<FileGridProps> = ({
                draggable
                onDragStart={(e) => handleDragStart(e, item)}
                onDragEnd={handleDragEnd}
-               onClick={(e) => onToggleSelect(item.id, e.metaKey || e.ctrlKey)}
+               onClick={(e) => handleClick(e, item)}
                onDoubleClick={() => onOpen(item)}
                onContextMenu={(e) => onContextMenu && onContextMenu(e, item)}
                className={`
                  group flex items-center gap-4 p-2 rounded-lg border transition-all cursor-pointer select-none relative
                  ${isSelected 
-                   ? 'bg-blue-600/20 border-blue-500/50' 
+                   ? 'bg-blue-600/20 border-blue-500/50 ring-1 ring-blue-500/20' 
                    : 'bg-transparent border-transparent hover:bg-slate-800 hover:border-slate-700/50'}
                `}
              >
@@ -128,14 +137,14 @@ export const FileGrid: React.FC<FileGridProps> = ({
             draggable
             onDragStart={(e) => handleDragStart(e, item)}
             onDragEnd={handleDragEnd}
-            onClick={(e) => onToggleSelect(item.id, e.metaKey || e.ctrlKey)}
+            onClick={(e) => handleClick(e, item)}
             onDoubleClick={() => onOpen(item)}
             onContextMenu={(e) => onContextMenu && onContextMenu(e, item)}
             className={`
               relative group rounded-xl p-4 border transition-all cursor-pointer select-none
               flex flex-col gap-2 h-32
               ${isSelected 
-                ? 'bg-blue-600/20 border-blue-500 ring-1 ring-blue-500/50' 
+                ? 'bg-blue-600/20 border-blue-500 ring-1 ring-blue-500/50 shadow-lg shadow-blue-500/10' 
                 : 'bg-slate-800/40 border-slate-700/50 hover:bg-slate-800 hover:border-slate-600'}
             `}
           >

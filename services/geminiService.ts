@@ -5,7 +5,6 @@ const getAiClient = () => {
   return new GoogleGenAI({ apiKey: process.env.API_KEY });
 };
 
-// ... (Existing helper functions: getAllLinks) ...
 // Helper to recursively get all links from the tree
 const getAllLinks = (nodes: BookmarkNode[]): BookmarkNode[] => {
   const links: BookmarkNode[] = [];
@@ -21,8 +20,6 @@ const getAllLinks = (nodes: BookmarkNode[]): BookmarkNode[] => {
   traverse(nodes);
   return links;
 };
-
-// ... (Existing functions: enrichBookmarks, generateUserPreferencesQuiz, generatePeriodicQuestion, organizeBookmarksWithGemini, suggestFolderName, optimizeTitles) ...
 
 export const enrichBookmarks = async (
   bookmarks: BookmarkNode[]
@@ -233,10 +230,28 @@ export const organizeBookmarksWithGemini = async (
     });
 
     let text = response.text || "";
-    const firstBrace = text.indexOf('{');
-    const lastBrace = text.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace !== -1) {
-        text = text.substring(firstBrace, lastBrace + 1);
+    
+    // Robust JSON extraction using brace counting
+    // This handles cases where Gemini outputs multiple JSON objects or appends text
+    const startIndex = text.indexOf('{');
+    if (startIndex !== -1) {
+      let braceCount = 0;
+      let endIndex = -1;
+      for (let i = startIndex; i < text.length; i++) {
+        if (text[i] === '{') {
+          braceCount++;
+        } else if (text[i] === '}') {
+          braceCount--;
+          if (braceCount === 0) {
+            endIndex = i;
+            break;
+          }
+        }
+      }
+      
+      if (endIndex !== -1) {
+        text = text.substring(startIndex, endIndex + 1);
+      }
     }
     
     return text ? JSON.parse(text) : { "Unsorted": payload.map(p => p.id) };
@@ -300,7 +315,6 @@ export const optimizeTitles = async (items: BookmarkNode[]): Promise<Map<string,
   }
 };
 
-// NEW: Agent Command Parser
 export interface AgentCommand {
   action: 'MOVE' | 'DELETE' | 'CREATE_FOLDER' | 'RENAME' | 'UNKNOWN';
   targetName?: string;
@@ -353,5 +367,61 @@ export const parseAgentCommand = async (command: string): Promise<AgentCommand> 
   } catch (e) {
     console.error("Agent Parsing Error", e);
     return { action: 'UNKNOWN', reason: "Failed to parse command." };
+  }
+};
+
+// NEW: Auto-Filing Service
+export const autoFileBookmarks = async (
+  items: BookmarkNode[], 
+  availablePaths: string[]
+): Promise<{ id: string; targetPath: string; newTitle: string }[]> => {
+  const ai = getAiClient();
+  
+  // Create a simplified list of folders to avoid context overflow if huge
+  const folders = availablePaths.slice(0, 400).join("\n"); 
+
+  const payload = items.map(i => ({ id: i.id, title: i.title, url: i.url }));
+
+  const prompt = `
+    You are an autonomous organization agent (AutoFiler).
+    
+    TASKS:
+    1. Inspect each bookmark URL/Title.
+    2. Improve the title if it is cryptic or messy.
+    3. Select the BEST matching folder from the "Available Folders" list.
+    
+    AVAILABLE FOLDERS:
+    ${folders}
+    
+    INPUT BOOKMARKS:
+    ${JSON.stringify(payload)}
+    
+    RULES:
+    - If no folder is a good match, return "Unsorted" or null as targetPath.
+    - Be decisive.
+    
+    OUTPUT JSON SCHEMA:
+    {
+      "results": [
+        { "id": "string", "targetPath": "string", "newTitle": "string" }
+      ]
+    }
+  `;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json"
+      }
+    });
+
+    const text = response.text || "{}";
+    const data = JSON.parse(text);
+    return data.results || [];
+  } catch (e) {
+    console.error("AutoFile Error", e);
+    return [];
   }
 };

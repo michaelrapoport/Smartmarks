@@ -1,7 +1,12 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { BookmarkNode, BookmarkType, QuizQuestion, QuizAnswer } from '../types';
+import { getBedrockClient } from './bedrockClient';
 
 const getAiClient = () => {
+  const selectedBedrock = localStorage.getItem('smartmark_bedrock_model');
+  if (selectedBedrock) {
+     return getBedrockClient();
+  }
   return new GoogleGenAI({ apiKey: process.env.API_KEY });
 };
 

@@ -16,12 +16,19 @@ import { QuizModal } from './components/QuizModal';
 import { LogWindow } from './components/LogWindow';
 import { ContextMenu } from './components/ContextMenu';
 import { AgentBar } from './components/AgentBar';
+import { BedrockModal } from './components/BedrockModal';
 import { UploadCloud, CheckCircle, Activity, LayoutGrid, AlertCircle, Settings, RefreshCcw } from 'lucide-react';
 
 const COOKIE_NAME = 'smartmark_quiz_answers';
 
 const App: React.FC = () => {
   const [state, setState] = useState<AppState>(AppState.UPLOAD);
+  const [showBedrockModal, setShowBedrockModal] = useState<boolean>(
+    !localStorage.getItem('smartmark_bedrock_model')
+  );
+  const [selectedBedrockModel, setSelectedBedrockModel] = useState<string | null>(
+    localStorage.getItem('smartmark_bedrock_model')
+  );
   
   // Data State
   const [rootNodes, setRootNodes] = useState<BookmarkNode[]>([]);
@@ -1158,8 +1165,15 @@ const App: React.FC = () => {
     <input type="file" ref={fileInputRef} className="hidden" accept=".html" onChange={handleFileUpload} />
   );
 
+  const handleSelectModel = (modelId: string) => {
+    localStorage.setItem('smartmark_bedrock_model', modelId);
+    setSelectedBedrockModel(modelId);
+    setShowBedrockModal(false);
+  };
+
   return (
     <div className="h-screen bg-slate-900 flex flex-col text-slate-200 overflow-hidden relative">
+      {showBedrockModal && <BedrockModal onSelectModel={handleSelectModel} />}
       <FileInput />
       
       {contextMenu && (

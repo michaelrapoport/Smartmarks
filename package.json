@@ -6,12 +6,20 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "node server.js",
+    "start": "node server.js"
   },
   "dependencies": {
-    "react": "^19.2.3",
+    "@aws-sdk/client-bedrock": "^3.1133.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1133.0",
+    "@aws-sdk/credential-providers": "^3.1133.0",
     "@google/genai": "^1.35.0",
+    "@types/body-parser": "^1.19.6",
+    "body-parser": "^2.3.0",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
     "lucide-react": "^0.562.0",
+    "react": "^19.2.3",
     "react-dom": "^19.2.3",
     "recharts": "^3.6.0"
   },
